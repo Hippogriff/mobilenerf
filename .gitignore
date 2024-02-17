@@ -23,3 +23,10 @@ poetry.lock
 
 # PyCharm
 .idea
+jax3d/jax3d/projects/mobilener/datasets/
+jax3d/jax3d/projects/mobilener/models/
+jax3d/jax3d/projects/mobilener/outputs/
+jax3d/jax3d/projects/mobilener/weights/
+jax3d/jax3d/projects/mobilener/figures/
+jax3d/jax3d/projects/mobilener/samples/
+jax3d/jax3d/projects/mobilener/samples_bkp/

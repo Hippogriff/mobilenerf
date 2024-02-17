@@ -12,10 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 
-scene_type = "synthetic"
-object_name = "chair"
-scene_dir = "datasets/nerf_synthetic/"+object_name
+object_name = sys.argv[1]
+scene_type = sys.argv[2]
+
+if scene_type=="synthetic":
+  dir_name = "nerf_synthetic"
+elif scene_type=="real360":
+  dir_name = "mip"
+scene_dir = "datasets/{}/".format(dir_name)+object_name
+
+# print all information
+print("Stage 2")
+print("object_name: ", object_name)
+print("scene_type: ", scene_type)
+print("scene_dir: ", scene_dir)
+
 
 # synthetic
 # chair drums ficus hotdog lego materials mic ship
@@ -37,7 +50,6 @@ import gc
 import json
 import os
 import numpy
-import cv2
 from tqdm import tqdm
 import pickle
 import jax
@@ -52,20 +64,28 @@ import time
 import matplotlib.pyplot as plt
 from PIL import Image
 from multiprocessing.pool import ThreadPool
+from matplotlib import pyplot as plt
+
 
 print(jax.local_devices())
 if len(jax.local_devices())!=8:
   print("ERROR: need 8 v100 GPUs")
-  1/0
-weights_dir = "weights"
-samples_dir = "samples"
+  # 1/0
+weights_dir = "weights/{}".format(object_name)
+samples_dir = "samples/{}".format(object_name)
+
 if not os.path.exists(weights_dir):
   os.makedirs(weights_dir)
 if not os.path.exists(samples_dir):
   os.makedirs(samples_dir)
 def write_floatpoint_image(name,img):
   img = numpy.clip(numpy.array(img)*255,0,255).astype(numpy.uint8)
-  cv2.imwrite(name,img[:,:,::-1])
+  # cv2.imwrite(name,img[:,:,::-1])
+  try:
+    plt.imsave(name, img)
+  except:
+    plt.imsave(name, img[:, :, 0])
+
 #%% --------------------------------------------------------------------------------
 # ## Load the dataset.
 #%%
@@ -453,6 +473,8 @@ if scene_type=="synthetic":
   scene_grid_scale = 1.2
   if "hotdog" in scene_dir or "mic" in scene_dir or "ship" in scene_dir:
     scene_grid_scale = 1.5
+  if "hairy_monkey" in scene_dir:
+    scene_grid_scale = 3.0
   grid_min = np.array([-1, -1, -1]) * scene_grid_scale
   grid_max = np.array([ 1,  1,  1]) * scene_grid_scale
   point_grid_size = 128
@@ -1317,7 +1339,7 @@ point_grid = None
 acc_grid = None
 #%% --------------------------------------------------------------------------------
 # ## Load weights
-#%%
+#%%# TODO Change this to weights_stage1.pkl
 vars = pickle.load(open(weights_dir+"/"+"weights_stage1.pkl", "rb"))
 model_vars = vars
 #%% --------------------------------------------------------------------------------
@@ -1478,7 +1500,7 @@ def compute_TV(acc_grid):
   TV = np.mean(np.square(dx))+np.mean(np.square(dy))+np.mean(np.square(dz))
   return TV
 
-def train_step(state, rng, traindata, lr, wdistortion, wbinary, wbgcolor, batch_size, keep_num, threshold):
+def train_step(state, model_vars, rng, traindata, lr, wdistortion, wbinary, wbgcolor, batch_size, keep_num, threshold):
   key, rng = random.split(rng)
   rays, pixels = random_ray_batch(
       key, batch_size // n_device, traindata)
@@ -1507,22 +1529,29 @@ def train_step(state, rng, traindata, lr, wdistortion, wbinary, wbgcolor, batch_
     return loss_color_l2 + loss_color_l2_b + loss_distortion + loss_acc + point_loss, loss_color_l2_b_
 
   grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-  (total_loss, color_loss_l2), grad = grad_fn(state.target)
+  (total_loss, color_loss_l2), grad = grad_fn(model_vars)
   total_loss = jax.lax.pmean(total_loss, axis_name='batch')
   color_loss_l2 = jax.lax.pmean(color_loss_l2, axis_name='batch')
 
   grad = jax.lax.pmean(grad, axis_name='batch')
-  state = state.apply_gradient(grad, learning_rate=lr)
-
-  return state, color_loss_l2
+  # state = state.apply_gradient(grad, learning_rate=lr)
+  updates, state = optimizer.update(grad, state)
+  model_vars = optax.apply_updates(updates, model_vars)
+  return state, model_vars, color_loss_l2
 
 train_pstep = jax.pmap(train_step, axis_name='batch',
-                       in_axes=(0, 0, 0, None, None, None, None, None, None, None),
-                       static_broadcasted_argnums = (7,8,))
+                       in_axes=(0, 0, 0, 0, None, None, None, None, None, None, None),
+                       static_broadcasted_argnums = (8,9,))
 traindata_p = flax.jax_utils.replicate(data['train'])
-state = flax.optim.Adam(**adam_kwargs).create(model_vars)
+# state = flax.optim.Adam(**adam_kwargs).create(model_vars)
+import optax
 
-step_init = state.state.step
+optimizer = optax.adam(learning_rate=1e-5, b1=0.9, b2=0.999, eps=1e-15)
+
+state = optimizer.init(model_vars)
+model_vars = flax.jax_utils.replicate(model_vars)
+
+step_init = 0 # state.state.step
 state = flax.jax_utils.replicate(state)
 print(f'starting at {step_init}')
 
@@ -1560,8 +1589,8 @@ for i in tqdm(range(step_init, training_iters + 1)):
 
   rng, key1, key2 = random.split(rng, 3)
   key2 = random.split(key2, n_device)
-  state, color_loss_l2 = train_pstep(
-      state, key2, traindata_p,
+  state, model_vars, color_loss_l2 = train_pstep(
+      state, model_vars, key2, traindata_p,
       lr,
       wdistortion,
       wbinary,
@@ -1583,15 +1612,16 @@ for i in tqdm(range(step_init, training_iters + 1)):
 
     #stop when iteration>200000 and the training psnr drops
     if i>200000 and this_train_psnr<=train_psnr_max-0.001:
-      unreplicated_state = pickle.load(open(weights_dir+"/s2_0_"+"tmp_state"+str(i-10000)+".pkl", "rb"))
-      vars = unreplicated_state.target
+      unreplicated_state = pickle.load(open(weights_dir+"/s2_0_"+"tmp_state"+".pkl", "rb"))
+      unreplicated_model_vars = flax.jax_utils.unreplicate(model_vars)
+      vars = unreplicated_model_vars
       break
 
     train_psnr_max = max(this_train_psnr,train_psnr_max)
     gc.collect()
 
     unreplicated_state = flax.jax_utils.unreplicate(state)
-    pickle.dump(unreplicated_state, open(weights_dir+"/s2_0_"+"tmp_state"+str(i)+".pkl", "wb"))
+    pickle.dump(unreplicated_state, open(weights_dir+"/s2_0_"+"tmp_state"+".pkl", "wb"))
 
     print('Current iteration %d, elapsed training time: %d min %d sec.'
           % (i, t_total // 60, int(t_total) % 60))
@@ -1606,7 +1636,7 @@ for i in tqdm(range(step_init, training_iters + 1)):
     print('  %0.3f secs per iter.' % (t_elapsed / i_elapsed))
     print('  %0.3f iters per sec.' % (i_elapsed / t_elapsed))
 
-    vars = unreplicated_state.target
+    vars = flax.jax_utils.unreplicate(model_vars)
     rays = camera_ray_batch(
         data['test']['c2w'][selected_test_index], data['test']['hwf'])
     gt = data['test']['images'][selected_test_index]
@@ -1650,10 +1680,14 @@ render_poses = data['test']['c2w'][:len(data['test']['images'])]
 frames = []
 framemasks = []
 print("Testing")
+index = 0
 for p in tqdm(render_poses):
   out = render_loop(camera_ray_batch(p, hwf), vars, test_batch_size)
   frames.append(out[2])
   framemasks.append(out[3])
+  write_floatpoint_image(samples_dir+"/s2_0_"+str(index)+"_rgb_test_new.png",out[2])
+  index += 1
+
 psnrs_test = [-10 * np.log10(np.mean(np.square(rgb - gt))) for (rgb, gt) in zip(frames, data['test']['images'])]
 print("Test set average PSNR: %f" % np.array(psnrs_test).mean())
 
@@ -1756,6 +1790,8 @@ model_vars = vars
 def render_rays(rays, vars, keep_num, threshold, wbgcolor, rng): ### antialiasing by supersampling
 
   #---------- ray-plane intersection points
+  if vars[1].shape[0]==1:
+    vars[1] = vars[1][0]
   grid_indices, grid_masks = gridcell_from_rays(rays, vars[1], keep_num, threshold)
 
   pts, grid_masks, points, fake_t = compute_undc_intersection(vars[0],
@@ -1863,7 +1899,7 @@ write_floatpoint_image(samples_dir+"/s2_1_"+str(0)+"_acc_binarized.png",acc_b)
 #%% --------------------------------------------------------------------------------
 # ## Training loop
 #%%
-def train_step(state, rng, traindata, lr, wdistortion, wbinary, wbgcolor, batch_size, keep_num, threshold):
+def train_step(state, model_vars, rng, traindata, lr, wdistortion, wbinary, wbgcolor, batch_size, keep_num, threshold):
   key, rng = random.split(rng)
   rays, pixels = random_ray_batch(
       key, batch_size // n_device, traindata)
@@ -1877,23 +1913,27 @@ def train_step(state, rng, traindata, lr, wdistortion, wbinary, wbgcolor, batch_
     return loss_color_l2_b, loss_color_l2_b
 
   grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-  (total_loss, color_loss_l2), grad = grad_fn(state.target)
+  (total_loss, color_loss_l2), grad = grad_fn(model_vars)
   total_loss = jax.lax.pmean(total_loss, axis_name='batch')
   color_loss_l2 = jax.lax.pmean(color_loss_l2, axis_name='batch')
 
-  grad = jax.lax.pmean(grad, axis_name='batch')
-  state = state.apply_gradient(grad, learning_rate=lr)
+  # grad = jax.lax.pmean(grad, axis_name='batch')
+  # state = state.apply_gradient(grad, learning_rate=lr)
 
-  return state, color_loss_l2
+  # return state, color_loss_l2
+  updates, state = optimizer.update(grad, state)
+  model_vars = optax.apply_updates(updates, model_vars)
+  return state, model_vars, color_loss_l2
 
 train_pstep = jax.pmap(train_step, axis_name='batch',
-                       in_axes=(0, 0, 0, None, None, None, None, None, None, None),
-                       static_broadcasted_argnums = (7,8,))
+                       in_axes=(0, 0, 0, 0, None, None, None, None, None, None, None),
+                       static_broadcasted_argnums = (8,9,))
 traindata_p = flax.jax_utils.replicate(data['train'])
-state = flax.optim.Adam(**adam_kwargs).create(model_vars)
+# state = flax.optim.Adam(**adam_kwargs).create(model_vars)
 
-step_init = state.state.step
-state = flax.jax_utils.replicate(state)
+step_init = 0
+# state = flax.jax_utils.replicate(state)
+model_vars = flax.jax_utils.replicate(model_vars)
 print(f'starting at {step_init}')
 
 # Training loop
@@ -1928,8 +1968,8 @@ for i in tqdm(range(step_init, training_iters + 1)):
 
   rng, key1, key2 = random.split(rng, 3)
   key2 = random.split(key2, n_device)
-  state, color_loss_l2 = train_pstep(
-      state, key2, traindata_p,
+  state, model_vars, color_loss_l2 = train_pstep(
+      state, model_vars, key2, traindata_p,
       lr,
       wdistortion,
       wbinary,
@@ -1951,6 +1991,7 @@ for i in tqdm(range(step_init, training_iters + 1)):
     gc.collect()
 
     unreplicated_state = flax.jax_utils.unreplicate(state)
+    unreplicated_model_vars = flax.jax_utils.unreplicate(model_vars)
     pickle.dump(unreplicated_state, open(weights_dir+"/s2_1_"+"tmp_state"+str(i)+".pkl", "wb"))
 
     print('Current iteration %d, elapsed training time: %d min %d sec.'
@@ -1966,7 +2007,8 @@ for i in tqdm(range(step_init, training_iters + 1)):
     print('  %0.3f secs per iter.' % (t_elapsed / i_elapsed))
     print('  %0.3f iters per sec.' % (i_elapsed / t_elapsed))
 
-    vars = unreplicated_state.target
+    # vars = unreplicated_state.target
+    vars = unreplicated_model_vars
     rays = camera_ray_batch(
         data['test']['c2w'][selected_test_index], data['test']['hwf'])
     gt = data['test']['images'][selected_test_index]
@@ -2002,22 +2044,37 @@ render_poses = data['test']['c2w'][:len(data['test']['images'])]
 frames = []
 framemasks = []
 print("Testing")
+index = 0
 for p in tqdm(render_poses):
   out = render_loop(camera_ray_batch(p, hwf), vars, test_batch_size)
   frames.append(out[0])
   framemasks.append(out[1])
+  import ipdb; ipdb.set_trace()
+  write_floatpoint_image(samples_dir+"/s2_1_"+str(index)+"_rgb_test_new.png", out[0])
+  index += 1
+
 psnrs_test = [-10 * np.log10(np.mean(np.square(rgb - gt))) for (rgb, gt) in zip(frames, data['test']['images'])]
 print("Test set average PSNR: %f" % np.array(psnrs_test).mean())
-
+                      
 #%%
 ssim_values = []
 for i in range(len(data['test']['images'])):
   ssim = ssim_fn(frames[i], data['test']['images'][i])
   ssim_values.append(float(ssim))
-
+  # save images
 print("Test set average SSIM: %f" % np.array(ssim_values).mean())
 #%%
 #%% --------------------------------------------------------------------------------
 # ## Save weights
 #%%
 pickle.dump(vars, open(weights_dir+"/"+"weights_stage2_1.pkl", "wb"))
+# save psnr and ssim into numpy array
+np.save(weights_dir+"/"+"psnrs_test.npy", np.array(psnrs_test).mean())
+np.save(weights_dir+"/"+"ssim_values.npy", np.array(ssim_values).mean())
+
+# drums
+# garden
+# labdog
+# smokey_monkey
+# hairy_monkey
+# bottled_ship_new

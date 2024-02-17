@@ -11,11 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
 
+object_name = sys.argv[1]
+scene_type = sys.argv[2]
 
-scene_type = "synthetic"
-object_name = "chair"
-scene_dir = "datasets/nerf_synthetic/"+object_name
+if scene_type=="synthetic":
+  dir_name = "nerf_synthetic"
+elif scene_type=="real360":
+  dir_name = "mip"
+scene_dir = "datasets/{}/".format(dir_name)+object_name
+# print all information
+print("Stage 1")
+
+print("object_name: ", object_name)
+print("scene_type: ", scene_type)
+print("scene_dir: ", scene_dir)
 
 # synthetic
 # chair drums ficus hotdog lego materials mic ship
@@ -35,7 +46,7 @@ import gc
 import json
 import os
 import numpy
-import cv2
+from matplotlib import pyplot as plt
 from tqdm import tqdm
 import pickle
 import jax
@@ -54,16 +65,21 @@ from multiprocessing.pool import ThreadPool
 print(jax.local_devices())
 if len(jax.local_devices())!=8:
   print("ERROR: need 8 v100 GPUs")
-  1/0
-weights_dir = "weights"
-samples_dir = "samples"
+  #1/0
+weights_dir = "weights/{}".format(object_name)
+samples_dir = "samples/{}".format(object_name)
 if not os.path.exists(weights_dir):
   os.makedirs(weights_dir)
 if not os.path.exists(samples_dir):
   os.makedirs(samples_dir)
 def write_floatpoint_image(name,img):
   img = numpy.clip(numpy.array(img)*255,0,255).astype(numpy.uint8)
-  cv2.imwrite(name,img[:,:,::-1])
+  # cv2.imwrite(name,img[:,:,::-1])
+  try:
+    plt.imsave(name, img)
+  except:
+    plt.imsave(name, img[:, :, 0])
+
 #%% --------------------------------------------------------------------------------
 # ## Load the dataset
 #%%
@@ -420,6 +436,8 @@ if scene_type=="synthetic":
   scene_grid_scale = 1.2
   if "hotdog" in scene_dir or "mic" in scene_dir or "ship" in scene_dir:
     scene_grid_scale = 1.5
+  if "hairy_monkey" in scene_dir:
+    scene_grid_scale = 3.0
   grid_min = np.array([-1, -1, -1]) * scene_grid_scale
   grid_max = np.array([ 1,  1,  1]) * scene_grid_scale
   point_grid_size = 128
@@ -1433,7 +1451,7 @@ def compute_TV(acc_grid):
   TV = np.mean(np.square(dx))+np.mean(np.square(dy))+np.mean(np.square(dz))
   return TV
 
-def train_step(state, rng, traindata, lr, wdistortion, wbinary, wbgcolor, batch_size, keep_num, threshold):
+def train_step(state, model_vars, rng, traindata, lr, wdistortion, wbinary, wbgcolor, batch_size, keep_num, threshold):
   key, rng = random.split(rng)
   rays, pixels = random_ray_batch(
       key, batch_size // n_device, traindata)
@@ -1460,23 +1478,40 @@ def train_step(state, rng, traindata, lr, wdistortion, wbinary, wbgcolor, batch_
     return loss_color_l2 + loss_distortion + loss_acc + point_loss, loss_color_l2
 
   grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-  (total_loss, color_loss_l2), grad = grad_fn(state.target)
+  (total_loss, color_loss_l2), grad = grad_fn(model_vars)
   total_loss = jax.lax.pmean(total_loss, axis_name='batch')
   color_loss_l2 = jax.lax.pmean(color_loss_l2, axis_name='batch')
 
   grad = jax.lax.pmean(grad, axis_name='batch')
-  state = state.apply_gradient(grad, learning_rate=lr)
-
-  return state, color_loss_l2
+  # state = state.apply_gradient(grad, learning_rate=lr)
+  # grad = jax.grad(loss_fn)(model_vars)
+  state.hyperparams['learning_rate'] = lr
+  # print(np.array(state.hyperparams['learning_rate']))
+  updates, state = optimizer.update(grad, state)
+  model_vars = optax.apply_updates(updates, model_vars)
+  return state, model_vars, color_loss_l2
 
 train_pstep = jax.pmap(train_step, axis_name='batch',
-                       in_axes=(0, 0, 0, None, None, None, None, None, None, None),
-                       static_broadcasted_argnums = (7,8,))
+                       in_axes=(0, 0, 0, 0, None, None, None, None, None, None, None),
+                       static_broadcasted_argnums = (8,9,))
 traindata_p = flax.jax_utils.replicate(data['train'])
-state = flax.optim.Adam(**adam_kwargs).create(model_vars)
 
-step_init = state.state.step
+import optax
+# TODO update learning rate
+adam_kwargs = {
+    'beta1': 0.9,
+    'beta2': 0.999,
+    'eps': 1e-15,
+}
+optimizer = optax.inject_hyperparams(optax.adam)(learning_rate=1e-3, b1=0.9, b2=0.999, eps=1e-15)
+# optimizer = optax.adam(learning_rate=1e-4, b1=0.9, b2=0.999, eps=1e-15)
+state = optimizer.init(model_vars)
+
+# state = flax.optim.Adam(**adam_kwargs).create(model_vars)
+
+step_init = 0 # state.state.step
 state = flax.jax_utils.replicate(state)
+model_vars = flax.jax_utils.replicate(model_vars)
 print(f'starting at {step_init}')
 
 # Training loop
@@ -1523,8 +1558,8 @@ for i in tqdm(range(step_init, training_iters + 1)):
 
   rng, key1, key2 = random.split(rng, 3)
   key2 = random.split(key2, n_device)
-  state, color_loss_l2 = train_pstep(
-      state, key2, traindata_p,
+  state, model_vars, color_loss_l2 = train_pstep(
+      state, model_vars, key2, traindata_p,
       lr,
       wdistortion,
       wbinary,
@@ -1545,10 +1580,13 @@ for i in tqdm(range(step_init, training_iters + 1)):
     gc.collect()
 
     unreplicated_state = flax.jax_utils.unreplicate(state)
-    pickle.dump(unreplicated_state, open(weights_dir+"/s1_"+"tmp_state"+str(i)+".pkl", "wb"))
-
+    unreplicated_model_vars = flax.jax_utils.unreplicate(model_vars)
+    pickle.dump(unreplicated_state, open(weights_dir+"/s1_"+"tmp_state"+".pkl", "wb"))
+    
+    pickle.dump(unreplicated_model_vars, open(weights_dir+"/s1_"+"tmp_model_state"+".pkl", "wb"))
     print('Current iteration %d, elapsed training time: %d min %d sec.'
           % (i, t_total // 60, int(t_total) % 60))
+    
 
     print('Batch size: %d' % batch_size)
     print('Keep num: %d' % keep_num)
@@ -1559,8 +1597,11 @@ for i in tqdm(range(step_init, training_iters + 1)):
     print("Speed:")
     print('  %0.3f secs per iter.' % (t_elapsed / i_elapsed))
     print('  %0.3f iters per sec.' % (i_elapsed / t_elapsed))
+    
+    vars = unreplicated_model_vars # unreplicated_state.target
 
-    vars = unreplicated_state.target
+    pickle.dump(vars, open(weights_dir+"/"+"weights_stage1.pkl", "wb"))
+
     rays = camera_ray_batch(
         data['test']['c2w'][selected_test_index], data['test']['hwf'])
     gt = data['test']['images'][selected_test_index]
@@ -1581,7 +1622,7 @@ for i in tqdm(range(step_init, training_iters + 1)):
     plt.plot(iters, psnrs)
     plt.plot(iters_test, psnrs_test)
     p = np.array(psnrs)
-    plt.ylim(np.min(p) - .5, np.max(p) + .5)
+    plt.ylim(np.min(p) - .5, np.max(p) + .5)  
     plt.legend()
     plt.savefig(samples_dir+"/s1_"+str(i)+"_loss.png")
 
@@ -1694,3 +1735,7 @@ print("Test set average SSIM: %f" % np.array(ssim_values).mean())
 # ## Save weights
 #%%
 pickle.dump(vars, open(weights_dir+"/"+"weights_stage1.pkl", "wb"))
+import json
+# save psnr and ssim in numpy
+np.save(weights_dir+"/"+"psnr_stage1.npy", np.array(psnrs_test).mean())
+np.save(weights_dir+"/"+"ssim_stage1.npy", np.array(ssim_values).mean())
